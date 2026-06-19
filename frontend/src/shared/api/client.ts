@@ -63,7 +63,7 @@ export function getApiErrorMessage(error: unknown, fallback = 'Une erreur est su
 
 export const apiClient = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 10000,
+  timeout: 60000,
   headers: {
     'Content-Type': 'application/json'
   }
