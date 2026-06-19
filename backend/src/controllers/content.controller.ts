@@ -1,6 +1,12 @@
 import { Request, Response } from "express"
 import Article from "../models/article.model"
 
+import {
+    buildFacebookShareUrl,
+    buildPublicArticleUrl,
+    publishArticleLinkToFacebook
+} from "../services/facebook.service"
+
 const SHARE_PLATFORMS = ["whatsapp", "facebook", "linkedin", "twitter", "copyLink"] as const
 
 type SharePlatform = (typeof SHARE_PLATFORMS)[number]
@@ -166,69 +172,6 @@ function parseTags(value: unknown): string[] {
         .filter(Boolean)
 }
 
-function splitTextForTranslation(text: string, maxLength = 3500): string[] {
-    if (text.length <= maxLength) {
-        return [text]
-    }
-
-    const chunks: string[] = []
-    let remaining = text
-
-    while (remaining.length > maxLength) {
-        const newlineIndex = remaining.lastIndexOf("\n", maxLength)
-        const spaceIndex = remaining.lastIndexOf(" ", maxLength)
-        const splitIndex = Math.max(newlineIndex, spaceIndex)
-        const endIndex = splitIndex > maxLength * 0.6 ? splitIndex + 1 : maxLength
-
-        chunks.push(remaining.slice(0, endIndex))
-        remaining = remaining.slice(endIndex)
-    }
-
-    if (remaining) {
-        chunks.push(remaining)
-    }
-
-    return chunks
-}
-
-async function translateFrenchText(value: unknown): Promise<string> {
-    const text = typeof value === "string" ? value.trim() : ""
-
-    if (!text) {
-        return ""
-    }
-
-    const translatedChunks = await Promise.all(
-        splitTextForTranslation(text).map(async (chunk) => {
-            const params = new URLSearchParams({
-                client: "gtx",
-                sl: "fr",
-                tl: "en",
-                dt: "t",
-                q: chunk
-            })
-
-            const response = await fetch(`https://translate.googleapis.com/translate_a/single?${params.toString()}`)
-
-            if (!response.ok) {
-                throw new Error("Translation service unavailable")
-            }
-
-            const data = (await response.json()) as unknown
-            const segments = Array.isArray(data) ? data[0] : null
-
-            if (!Array.isArray(segments)) {
-                return chunk
-            }
-
-            return segments
-                .map((segment) => (Array.isArray(segment) && typeof segment[0] === "string" ? segment[0] : ""))
-                .join("")
-        })
-    )
-
-    return translatedChunks.join("").trim() || text
-}
 
 export const getContentStats = async (_req: Request, res: Response): Promise<void> => {
     try {
@@ -362,22 +305,24 @@ export const trackArticleShare = async (req: Request, res: Response): Promise<vo
 
 export const createArticle = async (req: Request, res: Response): Promise<void> => {
     try {
-        const { title, content } = req.body
+        const title = String(req.body.title || req.body.titleEn || "").trim()
+        const content = String(req.body.content || req.body.contentEn || "").trim()
 
         if (!title || !content) {
             res.status(400).json({
-                message: "Le titre et le contenu sont obligatoires"
+                message: "Le titre et le contenu sont obligatoires dans au moins une langue"
             })
             return
         }
 
-        const slug = req.body.slug || generateSlug(title)
+        const slugSource = String(req.body.slug || req.body.slugEn || title).trim()
+        const slug = generateSlug(slugSource)
 
         const existingArticle = await Article.findOne({ slug })
 
         if (existingArticle) {
             res.status(400).json({
-                message: "Un article avec ce titre existe déjà"
+                message: "Un article avec ce titre ou ce slug existe déjà"
             })
             return
         }
@@ -389,11 +334,13 @@ export const createArticle = async (req: Request, res: Response): Promise<void> 
 
         const article = await Article.create({
             ...req.body,
+            title,
+            content,
             tags,
+            tagsEn,
             slug,
             coverImage: imageUrl,
             status: req.body.status || "draft",
-            tagsEn,
             views: 0,
             shares: {
                 whatsapp: 0,
@@ -433,11 +380,15 @@ export const updateArticle = async (req: Request, res: Response): Promise<void> 
             payload.tagsEn = parseTags(payload.tagsEn)
         }
 
-        if (payload.title && !payload.slug) {
-            payload.slug = generateSlug(payload.title)
+        const titleForSlug = payload.title || payload.titleEn
+
+        if (titleForSlug && !payload.slug) {
+            payload.slug = generateSlug(String(titleForSlug))
         }
 
         if (payload.slug) {
+            payload.slug = generateSlug(String(payload.slug))
+
             const existingArticle = await Article.findOne({
                 slug: payload.slug,
                 _id: { $ne: req.params.id }
@@ -445,7 +396,7 @@ export const updateArticle = async (req: Request, res: Response): Promise<void> 
 
             if (existingArticle) {
                 res.status(400).json({
-                    message: "Un article avec ce titre existe déjà"
+                    message: "Un article avec ce titre ou ce slug existe déjà"
                 })
                 return
             }
@@ -544,37 +495,83 @@ export const unpublishArticle = async (req: Request, res: Response): Promise<voi
         res.status(500).json({ message: "Erreur dépublication article", error })
     }
 }
-export const translateArticle = async (req: Request, res: Response): Promise<void> => {
+export const getArticleFacebookShareUrl = async (
+    req: Request,
+    res: Response
+): Promise<void> => {
     try {
-        const { title, excerpt, content, category, tags } = req.body
+        const article = await Article.findById(req.params.id)
 
-        if (!title || !content) {
+        if (!article) {
+            res.status(404).json({ message: "Article introuvable" })
+            return
+        }
+
+        if (article.status !== "published") {
             res.status(400).json({
-                message: "Le titre et le contenu sont obligatoires pour la traduction"
+                success: false,
+                message: "L’article doit être publié avant d’être partagé sur Facebook."
             })
             return
         }
 
-        const sourceTags = parseTags(tags)
-        const [titleEn, excerptEn, contentEn, categoryEn, tagsEn] = await Promise.all([
-            translateFrenchText(title),
-            translateFrenchText(excerpt),
-            translateFrenchText(content),
-            translateFrenchText(category),
-            Promise.all(sourceTags.map((tag) => translateFrenchText(tag)))
-        ])
+        const articleUrl = buildPublicArticleUrl(article.slug)
+        const shareUrl = buildFacebookShareUrl(articleUrl)
 
         res.status(200).json({
-            titleEn,
-            excerptEn,
-            contentEn,
-            categoryEn,
-            tagsEn
+            success: true,
+            articleUrl,
+            shareUrl
         })
     } catch (error) {
         res.status(500).json({
-            message: "Erreur traduction article",
+            success: false,
+            message: "Erreur génération du lien Facebook",
             error: error instanceof Error ? error.message : error
         })
     }
+}
+
+export const publishArticleToFacebook = async (
+    req: Request,
+    res: Response
+): Promise<void> => {
+    try {
+        const article = await Article.findById(req.params.id)
+
+        if (!article) {
+            res.status(404).json({ message: "Article introuvable" })
+            return
+        }
+
+        if (article.status !== "published") {
+            res.status(400).json({
+                success: false,
+                message: "L’article doit être publié sur le site avant d’être publié sur Facebook."
+            })
+            return
+        }
+
+        const result = await publishArticleLinkToFacebook({
+            title: article.title,
+            excerpt: article.excerpt,
+            slug: article.slug
+        })
+
+        const statusCode = result.success ? 200 : 400
+
+        res.status(statusCode).json(result)
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            message: "Erreur publication Facebook",
+            error: error instanceof Error ? error.message : error
+        })
+    }
+}
+
+export const translateArticle = async (_req: Request, res: Response): Promise<void> => {
+    res.status(410).json({
+        message: "La traduction automatique est désactivée. Remplissez les champs français et anglais manuellement."
+    })
 }
